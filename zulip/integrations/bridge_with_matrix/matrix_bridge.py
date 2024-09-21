@@ -32,8 +32,18 @@ import zulip
 
 # change these templates to change the format of displayed message
 ZULIP_MESSAGE_TEMPLATE: str = "**{username}** [{uid}]: {message}"
-MATRIX_MESSAGE_TEMPLATE: str = "<{username} ({uid})> {message}"
+MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @**{username}** : {message}"
+MATRIX_NOTICE_TEMPLATE = "****Bridge notice****\n{message}"
 
+import logging
+
+logging.basicConfig(filename="zulip_matrix.log",
+                            filemode='a',
+                            format='%(asctime)s %(name)s %(levelname)s %(message)s',
+                            datefmt='%H:%M:%S',
+                            level=logging.INFO)
+
+logging.info("starting bridge...")
 
 class BridgeConfigError(Exception):
     pass
@@ -61,12 +71,14 @@ class MatrixToZulip:
         matrix_client: nio.AsyncClient,
         matrix_config: Dict[str, Any],
         zulip_client: zulip.Client,
+        zulip_config: Dict[str, Any],
         no_noise: bool,
     ) -> None:
         self.matrix_client: nio.AsyncClient = matrix_client
         self.matrix_config: Dict[str, Any] = matrix_config
         self.zulip_client: zulip.Client = zulip_client
         self.no_noise: bool = no_noise
+        self.zulip_config: Dict[str, Any] = zulip_config
 
     @classmethod
     async def create(
@@ -74,9 +86,10 @@ class MatrixToZulip:
         matrix_client: nio.AsyncClient,
         matrix_config: Dict[str, Any],
         zulip_client: zulip.Client,
+        zulip_config: Dict[str, Any],
         no_noise: bool,
     ) -> "MatrixToZulip":
-        matrix_to_zulip: "MatrixToZulip" = cls(matrix_client, matrix_config, zulip_client, no_noise)
+        matrix_to_zulip: "MatrixToZulip" = cls(matrix_client, matrix_config, zulip_client, zulip_config, no_noise)
 
         # Login to Matrix
         await matrix_to_zulip.matrix_login()
@@ -99,19 +112,64 @@ class MatrixToZulip:
             return
 
         if room.room_id not in self.matrix_config["bridges"]:
+            logging.error("room %s not in bridges", room.room_id)
             return
         stream, topic = self.matrix_config["bridges"][room.room_id]
 
-        content: Optional[str] = await self.get_message_content_from_event(event, room)
-        if not content:
+        raw_content: Optional[str] = await self.get_message_content_from_event(event, room)
+        if not raw_content:
             return
 
+        for s in self.zulip_config:
+            if s != "api_key":
+                v = self.zulip_config[s]
+                logging.warning("parsed zulip_config: %s=%s", s, v)
+            else:
+                logging.warning("parsed zulip_config: %s=REDACTED", s)
+
+        # check topic first
+        try:
+            #subject = matrix_validate_topic(raw_content, self.zulip_config["enforce_topic_per_room"])
+            subject = matrix_validate_topic(raw_content)
+            if self.zulip_config["enforce_topic_per_room"] == "true" and subject == None:
+                # do not allow setting custom topics:
+                subject = topic
+                content = raw_content
+                logging.warning("enforce_topic_per_room is >%s<! no custom topic allowed, using: %s", self.zulip_config["enforce_topic_per_room"], subject)
+            elif self.zulip_config["enforce_topic_per_message"] == "true" and subject == None:
+                # enforce users to SET a topic per message:
+                terr = "enforce_topic_per_message is enforced but no custom topic set!"
+                logging.warning("%s", terr)
+                raise ValueError(terr)
+            else:
+                if subject == None:
+                    # set the default topic if empty
+                    subject = topic
+                    content = raw_content
+                    logging.info("missing zulip topic, using default: %s", subject)
+                else:
+                    # set the given topic if defined
+                    subject = subject
+                    logging.info("zulip topic found from message: %s", subject)
+                    content = re.sub("#"+subject+"#","",raw_content)
+        except ValueError as err:
+            msg_notice = "YOUR MESSAGE WAS NOT BRIDGED TO ZULIP!\nReason: no topic given! ensure you prefix your message with\n\n\t#<topicname>#\n\t(e.g.: #general# <message text goes here>)\n\nor simply quote a message containing a matching topic."
+            await self.matrix_client.room_send(
+                        room.room_id,
+                        message_type="m.room.message",
+                        content={"msgtype": "m.notice", "body": msg_notice},
+                        )
+            content = ""
+            return self._matrix_to_zulip
+
+        # we do not want to see the zulip bot in quotes
+        content = re.sub('<' + self.matrix_config["mxid"] + '>','', content)
         try:
             result: Dict[str, Any] = self.zulip_client.send_message(
                 {
                     "type": "stream",
                     "to": stream,
-                    "subject": topic,
+                    "subject": subject,
                     "content": content,
                 }
             )
@@ -221,10 +279,12 @@ class ZulipToMatrix:
         self,
         zulip_client: zulip.Client,
         zulip_config: Dict[str, Any],
+        matrix_config: Dict[str, Any],
         matrix_client: nio.AsyncClient,
     ) -> None:
         self.zulip_client: zulip.Client = zulip_client
         self.zulip_config: Dict[str, Any] = zulip_config
+        self.matrix_config: Dict[str, Any] = matrix_config
         self.matrix_client: nio.AsyncClient = matrix_client
         self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
         # Precompute the url of the Zulip server, needed later.
@@ -240,9 +300,10 @@ class ZulipToMatrix:
         cls,
         zulip_client: zulip.Client,
         zulip_config: Dict[str, Any],
+        matrix_config: Dict[str, Any],
         matrix_client: nio.AsyncClient,
     ) -> "ZulipToMatrix":
-        zulip_to_matrix: "ZulipToMatrix" = cls(zulip_client, zulip_config, matrix_client)
+        zulip_to_matrix: "ZulipToMatrix" = cls(zulip_client, zulip_config, matrix_config, matrix_client)
         zulip_to_matrix.ensure_stream_membership()
         return zulip_to_matrix
 
@@ -259,11 +320,20 @@ class ZulipToMatrix:
 
         room_id: Optional[str] = self.get_matrix_room_for_zulip_message(msg)
         if room_id is None:
+            logging.debug("_zulip_to_matrix; room_id is None!")
             return
+#        if room_id == "unknown":
+#            logging.warning("_zulip_to_matrix; room_id is unknown")
+#            #key: Tuple[str, str] = (msg["display_recipient"], self.matrix_config["room_id"])
+#            #room_id = self.zulip_config["bridges"][key]
+#            for i in self.matrix_config:
+#                logging.warning("is is: %s", i)
+#            #room_id = self.matrix_config["room_id"]
+#            return
 
         sender: str = msg["sender_full_name"]
         content: str = MATRIX_MESSAGE_TEMPLATE.format(
-            username=sender, uid=msg["sender_id"], message=msg["content"]
+            topic=msg["subject"], username=sender,uid=msg["sender_id"], message=msg["content"]
         )
 
         # Forward Zulip message to Matrix.
@@ -328,7 +398,10 @@ class ZulipToMatrix:
 
         key: Tuple[str, str] = (msg["display_recipient"], msg["subject"])
         if key not in self.zulip_config["bridges"]:
-            return None
+            if self.matrix_config["allow_unknown_zulip_topics"] == "true":
+                return self.matrix_config["room_id"]
+            else:
+                return None
 
         return self.zulip_config["bridges"][key]
 
@@ -399,6 +472,48 @@ class ZulipToMatrix:
                 executor, self.zulip_client.call_on_each_message, self._zulip_to_matrix
             )
 
+#def matrix_validate_topic(content, topic_enforced):
+def matrix_validate_topic(content):
+    """
+    Matrix -> Zulip validate if a topic was given with:
+        #<topic># <message>
+    """
+    # find a zulip topic if any (first line only)
+    msg_subject = re.search(r"#([\w\s\(\)]+)#\s.*",content)
+    if msg_subject:
+        topic = msg_subject.group(1)
+        logging.debug("valid topic found: >%s<", topic)
+    else:
+        topic = None
+        logging.debug("no (valid) topic found!")
+    return topic
+
+def matrix_send_wrapper(self, **kwargs: Any) -> None:
+        matrix_client = self.matrix_client
+        self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+        #await self.matrix_client.room_send(**kwargs)
+
+        #"""Wrapper for sending messages to the matrix server."""
+        #result: Union[Response, ErrorResponse] = asyncio.run_coroutine_threadsafe(
+        #    self.matrix_client.room_send(**kwargs), self.loop
+        #).result()
+        #if isinstance(result, nio.RoomSendError):
+        #    raise BridgeFatalMatrixError(str(result))
+
+def matrix_send_notice(self, msg: Dict[str, Any], room: Any) -> bool:
+    matrix_text = MATRIX_NOTICE_TEMPLATE.format(
+          message=msg
+        )
+
+    matrix_send_wrapper(
+			self,
+            room_id=room.room_id,
+            message_type="m.room.message",
+            content={"msgtype": "m.notice", "body": matrix_text},
+        )
+
+    # send given notice to Matrix
+#    room.room_send(matrix_text)
 
 def die(*_: Any) -> None:
     # We actually want to exit, so run os._exit (so as not to be caught and restarted)
@@ -448,13 +563,13 @@ def generate_parser() -> argparse.ArgumentParser:
 
 
 def read_configuration(config_file: str) -> Dict[str, Dict[str, Any]]:
-    matrix_key_set: Set[str] = {"host", "mxid", "password"}
-    matrix_bridge_key_set: Set[str] = {"room_id"}
+    matrix_key_set: Set[str] = {"host", "mxid", "password", "allow_unknown_zulip_topics", "room_id"}
+    matrix_bridge_key_set: Set[str] = {"room_id", "allow_unknown_zulip_topics"}
     matrix_full_key_set: Set[str] = matrix_key_set | matrix_bridge_key_set
-    zulip_key_set: Set[str] = {"email", "api_key", "site"}
-    zulip_bridge_key_set: Set[str] = {"stream", "topic"}
+    zulip_key_set: Set[str] = {"email", "api_key", "site", "enforce_topic_per_room", "enforce_topic_per_message"}
+    zulip_bridge_key_set: Set[str] = {"stream", "topic", "enforce_topic_per_room", "enforce_topic_per_message"}
     zulip_full_key_set: Set[str] = zulip_key_set | zulip_bridge_key_set
-    bridge_key_set: Set[str] = {"room_id", "stream", "topic"}
+    bridge_key_set: Set[str] = {"room_id", "stream", "topic", "enforce_topic_per_room", "enforce_topic_per_message"}
 
     config: configparser.ConfigParser = configparser.ConfigParser()
 
@@ -549,10 +664,10 @@ async def run(zulip_config: Dict[str, Any], matrix_config: Dict[str, Any], no_no
             matrix_client = nio.AsyncClient(matrix_config["host"], matrix_config["mxid"])
 
             matrix_to_zulip: MatrixToZulip = await MatrixToZulip.create(
-                matrix_client, matrix_config, zulip_client, no_noise
+                matrix_client, matrix_config, zulip_client, zulip_config, no_noise
             )
             zulip_to_matrix: ZulipToMatrix = await ZulipToMatrix.create(
-                zulip_client, zulip_config, matrix_client
+                zulip_client, zulip_config, matrix_config, matrix_client
             )
 
             await asyncio.gather(matrix_to_zulip.run(), zulip_to_matrix.run())
@@ -597,6 +712,8 @@ def write_sample_config(target_path: str, zuliprc: Optional[str]) -> None:
                         ("site", "https://chat.zulip.org"),
                         ("stream", "test here"),
                         ("topic", "matrix"),
+                        ("enforce_topic_per_message", "false"),
+                        ("enforce_topic_per_room", "false"),
                     )
                 ),
             ),
@@ -607,6 +724,8 @@ def write_sample_config(target_path: str, zuliprc: Optional[str]) -> None:
                         ("room_id", "#example:matrix.org"),
                         ("stream", "new test"),
                         ("topic", "matrix"),
+                        ("enforce_topic_per_message", "false"),
+                        ("enforce_topic_per_room", "false"),
                     )
                 ),
             ),

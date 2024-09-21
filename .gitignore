@@ -15,8 +15,9 @@ develop-eggs
 .installed.cfg
 lib64
 
-# Installer logs
+# logs
 pip-log.txt
+zulip_matrix.log*
 
 # Unit test / coverage reports
 .coverage
@@ -44,6 +45,7 @@ zuliprc
 .zuliprc
 botserverrc
 .botserverrc
+bridge_*.conf
 
 # vim
 .swp
