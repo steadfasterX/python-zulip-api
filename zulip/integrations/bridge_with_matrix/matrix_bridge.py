@@ -35,6 +35,11 @@ ZULIP_MESSAGE_TEMPLATE: str = "**{username}** [{uid}]: {message}"
 MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @**{username}** : {message}"
 MATRIX_NOTICE_TEMPLATE = "****Bridge notice****\n{message}"
 
+# required to talk with the bot in Matrix:
+matrix_bot_prefix = '!zm'
+matrix_bot_prefix_len = len(matrix_bot_prefix)
+matrix_bot_max_cmd_len = matrix_bot_prefix_len + 10
+
 import logging
 
 logging.basicConfig(filename="zulip_matrix.log",
@@ -127,7 +132,38 @@ class MatrixToZulip:
             else:
                 logging.warning("parsed zulip_config: %s=REDACTED", s)
 
-        # check topic first
+        # check bot cmd first
+        botcmd = matrix_validate_cmd(event.body[:matrix_bot_prefix_len])
+        if botcmd:
+            logging.warning("BOT CMD detected! -> %s", event.body[:matrix_bot_prefix_len])
+            if event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len] == " topics":
+                s_id = self.zulip_client.get_stream_id(stream)
+                avail_topics = self.zulip_client.get_stream_topics(s_id["stream_id"])
+                logging.warning("topic handling: %s, %s", stream, s_id["stream_id"])
+                logging.debug("topics found: %s", avail_topics)
+                formatted_names = []
+
+                for t in avail_topics['topics']:
+                    name_with_hash = f"#{t['name']}#"
+                    formatted_names.append(name_with_hash)
+
+                names_hashed = "\n".join(formatted_names)
+
+                msg_notice = "Here the list of current available topics, to use one copy the whole tag #<name># and prefix it in your message:\n\n" + names_hashed
+                #TODO: logging.warning("no topics found!")
+                #msg_notice = "no topics found for stream (" + stream + ")"
+            else:
+                msg_notice = matrix_bot_cmd(event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len])
+
+            await self.matrix_client.room_send(
+                        room.room_id,
+                        message_type="m.room.message",
+                        content={"msgtype": "m.notice", "body": msg_notice},
+                        )
+            return
+
+        # check topic next
+        # TODO: threading: https://spec.matrix.org/unstable/client-server-api/#threading
         try:
             #subject = matrix_validate_topic(raw_content, self.zulip_config["enforce_topic_per_room"])
             subject = matrix_validate_topic(raw_content)
@@ -269,7 +305,6 @@ class MatrixToZulip:
 
         await self.matrix_client.sync_forever()
 
-
 class ZulipToMatrix:
     """
     Zulip -> Matrix
@@ -322,14 +357,6 @@ class ZulipToMatrix:
         if room_id is None:
             logging.debug("_zulip_to_matrix; room_id is None!")
             return
-#        if room_id == "unknown":
-#            logging.warning("_zulip_to_matrix; room_id is unknown")
-#            #key: Tuple[str, str] = (msg["display_recipient"], self.matrix_config["room_id"])
-#            #room_id = self.zulip_config["bridges"][key]
-#            for i in self.matrix_config:
-#                logging.warning("is is: %s", i)
-#            #room_id = self.matrix_config["room_id"]
-#            return
 
         sender: str = msg["sender_full_name"]
         content: str = MATRIX_MESSAGE_TEMPLATE.format(
@@ -472,7 +499,6 @@ class ZulipToMatrix:
                 executor, self.zulip_client.call_on_each_message, self._zulip_to_matrix
             )
 
-#def matrix_validate_topic(content, topic_enforced):
 def matrix_validate_topic(content):
     """
     Matrix -> Zulip validate if a topic was given with:
@@ -488,32 +514,52 @@ def matrix_validate_topic(content):
         logging.debug("no (valid) topic found!")
     return topic
 
-def matrix_send_wrapper(self, **kwargs: Any) -> None:
-        matrix_client = self.matrix_client
-        self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
-        #await self.matrix_client.room_send(**kwargs)
+def matrix_validate_cmd(content):
+    """
+    checks the first X chars to identify a bot command
+    returns true if a bot cmd and false if not
+    """
+    r = False
+    if content[:matrix_bot_prefix_len] == matrix_bot_prefix:
+        r = True
+    return r
 
-        #"""Wrapper for sending messages to the matrix server."""
-        #result: Union[Response, ErrorResponse] = asyncio.run_coroutine_threadsafe(
-        #    self.matrix_client.room_send(**kwargs), self.loop
-        #).result()
-        #if isinstance(result, nio.RoomSendError):
-        #    raise BridgeFatalMatrixError(str(result))
+def matrix_bot_cmd(cmd):
+    """
+    validate and executes a bot command and return its output to the calling func
+    """
+    valid_cmds = {
+        ' topics': matrix_bot_get_zulip_topics,
+        ' help': matrix_bot_help
+    }
+    if cmd in valid_cmds:
+        out = valid_cmds[cmd](valid_cmds)
+    else:
+        out = "Invalid command '{}'. Try one of the following: {}".format(cmd, ', '.join(valid_cmds.keys()))
+        logging.error(out)
+    return out
 
-def matrix_send_notice(self, msg: Dict[str, Any], room: Any) -> bool:
-    matrix_text = MATRIX_NOTICE_TEMPLATE.format(
-          message=msg
-        )
+def matrix_bot_help(valid_cmds):
+    """
+    prints the matrix bot usage
+    """
+    vcmds = '\n'.join(valid_cmds.keys())
+    out = f"""This is the Zulip <-> Matrix bridge help
+        
+all bot commands must use the following syntax:
 
-    matrix_send_wrapper(
-			self,
-            room_id=room.room_id,
-            message_type="m.room.message",
-            content={"msgtype": "m.notice", "body": matrix_text},
-        )
+{matrix_bot_prefix} <command>
 
-    # send given notice to Matrix
-#    room.room_send(matrix_text)
+Valid <commands> are:
+
+{vcmds}
+"""
+    return out
+
+def matrix_bot_get_zulip_topics(zc):
+    """
+    connects to zulip and lists all topics of a stream
+    """
 
 def die(*_: Any) -> None:
     # We actually want to exit, so run os._exit (so as not to be caught and restarted)
