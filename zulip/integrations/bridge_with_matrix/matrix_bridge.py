@@ -32,13 +32,17 @@ import zulip
 
 # change these templates to change the format of displayed message
 ZULIP_MESSAGE_TEMPLATE: str = "**{username}** [{uid}]: {message}"
-MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @**{username}** : {message}"
+#MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @**{username}** : {message}"
+MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @{username}: {message}"
 MATRIX_NOTICE_TEMPLATE = "****Bridge notice****\n{message}"
 
-# required to talk with the bot in Matrix:
+# required to talk with the bot in a bridged Matrix room:
 matrix_bot_prefix = '!zm'
 matrix_bot_prefix_len = len(matrix_bot_prefix)
 matrix_bot_max_cmd_len = matrix_bot_prefix_len + 10
+
+loglevel = "INFO"
+#loglevel = "DEBUG"
 
 import logging
 
@@ -46,7 +50,8 @@ logging.basicConfig(filename="zulip_matrix.log",
                             filemode='a',
                             format='%(asctime)s %(name)s %(levelname)s %(message)s',
                             datefmt='%H:%M:%S',
-                            level=logging.INFO)
+                            level=loglevel
+                            )
 
 logging.info("starting bridge...")
 
@@ -108,6 +113,22 @@ class MatrixToZulip:
 
         return matrix_to_zulip
 
+    async def _get_matrix_threads(self, room_id):
+        """
+        TODO: DEDUP with ZulipToMatrix!
+        check threads
+        -> room_get_threads(access_token, room_id, include=ThreadInclusion.all, paginate_from=None, limit=None)
+        """
+        threads = []
+
+        async for gth in self.matrix_client.room_get_threads(room_id=room_id, limit=None):
+            if isinstance(gth, nio.RoomSendError):
+                raise BridgeFatalMatrixError(str(gth))
+            threads.append(gth)
+            logging.warning("_get_matrix_threads; found matrix thread: %s", gth)
+
+        return threads
+
     async def _matrix_to_zulip(self, room: nio.MatrixRoom, event: nio.Event) -> None:
         logging.debug("_matrix_to_zulip; room %s, event: %s", room.room_id, event)
 
@@ -128,66 +149,99 @@ class MatrixToZulip:
         for s in self.zulip_config:
             if s != "api_key":
                 v = self.zulip_config[s]
-                logging.warning("parsed zulip_config: %s=%s", s, v)
+                logging.debug("parsed zulip_config: %s=%s", s, v)
             else:
-                logging.warning("parsed zulip_config: %s=REDACTED", s)
+                logging.debug("parsed zulip_config: %s=REDACTED", s)
 
         # check bot cmd first
-        botcmd = matrix_validate_cmd(event.body[:matrix_bot_prefix_len])
-        if botcmd:
-            logging.warning("BOT CMD detected! -> %s", event.body[:matrix_bot_prefix_len])
-            if event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len] == " topics":
-                s_id = self.zulip_client.get_stream_id(stream)
-                avail_topics = self.zulip_client.get_stream_topics(s_id["stream_id"])
-                logging.warning("topic handling: %s, %s", stream, s_id["stream_id"])
-                logging.debug("topics found: %s", avail_topics)
-                formatted_names = []
+        botcmd = False
+        if event.body is not None:
+            botcmd = matrix_validate_cmd(event.body[:matrix_bot_prefix_len])
+            if botcmd:
+                logging.warning("BOT CMD detected! -> %s", event.body[:matrix_bot_prefix_len])
+                if event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len] == " topics":
+                    s_id = self.zulip_client.get_stream_id(stream)
+                    avail_topics = self.zulip_client.get_stream_topics(s_id["stream_id"])
+                    logging.warning("topic handling: %s, %s", stream, s_id["stream_id"])
+                    logging.debug("topics found: %s", avail_topics)
+                    formatted_names = []
 
-                for t in avail_topics['topics']:
-                    name_with_hash = f"#{t['name']}#"
-                    formatted_names.append(name_with_hash)
+                    for t in avail_topics['topics']:
+                        name_with_hash = f"#{t['name']}#"
+                        formatted_names.append(name_with_hash)
 
-                names_hashed = "\n".join(formatted_names)
+                    names_hashed = "\n".join(formatted_names)
 
-                msg_notice = "Here the list of current available topics, to use one copy the whole tag #<name># and prefix it in your message:\n\n" + names_hashed
-                #TODO: logging.warning("no topics found!")
-                #msg_notice = "no topics found for stream (" + stream + ")"
-            else:
-                msg_notice = matrix_bot_cmd(event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len])
+                    msg_notice = "Here the list of current available topics, to use one copy the whole tag #<name># and prefix it in your message:\n\n" + names_hashed
+                    #TODO: logging.warning("no topics found!")
+                    #msg_notice = "no topics found for stream (" + stream + ")"
+                else:
+                    msg_notice = matrix_bot_cmd(event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len])
 
-            await self.matrix_client.room_send(
-                        room.room_id,
-                        message_type="m.room.message",
-                        content={"msgtype": "m.notice", "body": msg_notice},
-                        )
-            return
+                await self.matrix_client.room_send(
+                            room.room_id,
+                            message_type="m.room.message",
+                            content={"msgtype": "m.notice", "body": msg_notice},
+                            )
+                return
 
         # check topic next
-        # TODO: threading: https://spec.matrix.org/unstable/client-server-api/#threading
-        try:
-            #subject = matrix_validate_topic(raw_content, self.zulip_config["enforce_topic_per_room"])
-            subject = matrix_validate_topic(raw_content)
-            if self.zulip_config["enforce_topic_per_room"] == "true" and subject == None:
-                # do not allow setting custom topics:
-                subject = topic
-                content = raw_content
-                logging.warning("enforce_topic_per_room is >%s<! no custom topic allowed, using: %s", self.zulip_config["enforce_topic_per_room"], subject)
-            elif self.zulip_config["enforce_topic_per_message"] == "true" and subject == None:
-                # enforce users to SET a topic per message:
-                terr = "enforce_topic_per_message is enforced but no custom topic set!"
-                logging.warning("%s", terr)
-                raise ValueError(terr)
+        # TODO: DEDUP with ZulipToMatrix!
+        # check for (matching) Matrix threads
+        # https://spec.matrix.org/unstable/client-server-api/#threading
+        # room_get_threads(access_token, room_id, include=ThreadInclusion.all, paginate_from=None, limit=None)
+        #mthreads = asyncio.run_coroutine_threadsafe(self._get_matrix_threads(room.room_id), self.loop)
+        #m = mthreads.result()
+        m = await self._get_matrix_threads(room.room_id)
+
+        thread_event_id = None
+        matching_event_ids = []
+        in_thread = False
+        ztopic = None
+        m_content = None
+
+        logging.warning("FULL message is: %s", m)
+        for message in m:
+            logging.warning("message is: %s", message)
+            m_content = message.source['content']
+            if 'm.relates_to' in message.source:
+            #body = message.source['content']['body']
+            #if "m.relates_to" in message.source['content']:
+                in_thread = True
+                ztopic = matrix_validate_topic(body)
+                thread_event_id = message.event_id
+                logging.warning("we are in a matrix thread with zulip topic: %s and id: %s", ztopic, thread_event_id)
+                break
             else:
-                if subject == None:
-                    # set the default topic if empty
+                logging.warning("we are NOT in a matrix thread: %s", message)
+
+        try:
+            if in_thread is not None:
+                subject = ztopic
+                content = raw_content
+            else:
+                subject = matrix_validate_topic(raw_content)
+                if self.zulip_config["enforce_topic_per_room"] == "true" and subject == None:
+                    # if set: do not allow setting custom topics:
                     subject = topic
                     content = raw_content
-                    logging.info("missing zulip topic, using default: %s", subject)
+                    logging.warning("enforce_topic_per_room is >%s<! no custom topic allowed, using: %s", self.zulip_config["enforce_topic_per_room"], subject)
+                elif self.zulip_config["enforce_topic_per_message"] == "true" and subject == None:
+                    # if set: enforce users to SET a topic per message:
+                    terr = "enforce_topic_per_message is enforced but no custom topic set!"
+                    logging.warning("%s", terr)
+                    raise ValueError(terr)
                 else:
-                    # set the given topic if defined
-                    subject = subject
-                    logging.info("zulip topic found from message: %s", subject)
-                    content = re.sub("#"+subject+"#","",raw_content)
+                    if subject == None:
+                        # set the default topic if empty
+                        subject = topic
+                        content = raw_content
+                        logging.info("missing zulip topic, using default: %s", subject)
+                    else:
+                        # set the given topic if defined
+                        subject = subject
+                        logging.info("zulip topic found from message: %s", subject)
+                        content = re.sub("#"+subject+"#","",raw_content)
         except ValueError as err:
             msg_notice = "YOUR MESSAGE WAS NOT BRIDGED TO ZULIP!\nReason: no topic given! ensure you prefix your message with\n\n\t#<topicname>#\n\t(e.g.: #general# <message text goes here>)\n\nor simply quote a message containing a matching topic."
             await self.matrix_client.room_send(
@@ -303,7 +357,7 @@ class MatrixToZulip:
         # Set up event callback.
         self.matrix_client.add_event_callback(self._matrix_to_zulip, nio.Event)
 
-        await self.matrix_client.sync_forever()
+        await self.matrix_client.sync_forever(timeout=30)
 
 class ZulipToMatrix:
     """
@@ -349,6 +403,29 @@ class ZulipToMatrix:
         ).result()
         if isinstance(result, nio.RoomSendError):
             raise BridgeFatalMatrixError(str(result))
+        else:
+            # Check if the response contains an event_id and return it
+            if hasattr(result, 'event_id'):
+                logging.debug("_matrix_send; response was: %s", result)
+                return result.event_id
+            else:
+                logging.debug("_matrix_send; no event_id in response: %s", result)
+                return None
+
+    async def _get_matrix_threads(self, room_id):
+        """
+        check threads
+        -> room_get_threads(access_token, room_id, include=ThreadInclusion.all, paginate_from=None, limit=None)
+        """
+        threads = []
+
+        async for gth in self.matrix_client.room_get_threads(room_id=room_id, limit=None):
+            if isinstance(gth, nio.RoomSendError):
+                raise BridgeFatalMatrixError(str(gth))
+            threads.append(gth)
+            logging.warning("_get_matrix_threads; found matrix thread: %s", gth)
+
+        return threads
 
     def _zulip_to_matrix(self, msg: Dict[str, Any]) -> None:
         logging.debug("_zulip_to_matrix; msg: %s", msg)
@@ -360,16 +437,48 @@ class ZulipToMatrix:
 
         sender: str = msg["sender_full_name"]
         content: str = MATRIX_MESSAGE_TEMPLATE.format(
-            topic=msg["subject"], username=sender,uid=msg["sender_id"], message=msg["content"]
-        )
+            topic=msg["subject"], username=sender, uid=msg["sender_id"], message=msg["content"]
+            )
+        
+        # check for (matching) Matrix threads
+        # https://spec.matrix.org/unstable/client-server-api/#threading
+        # room_get_threads(access_token, room_id, include=ThreadInclusion.all, paginate_from=None, limit=None)
+        mthreads = asyncio.run_coroutine_threadsafe(self._get_matrix_threads(room_id), self.loop)
+        m = mthreads.result()
+        thread_event_id = None
+        matching_event_ids = []
 
-        # Forward Zulip message to Matrix.
-        self._matrix_send(
-            room_id=room_id,
-            message_type="m.room.message",
-            content={"msgtype": "m.text", "body": content},
-        )
+        for message in m:
+            body = message.source['content']['body']
+            ztopic = matrix_validate_topic(body)
+            if ztopic == msg["subject"]:
+                thread_event_id = message.event_id
+                matching_event_ids.append(thread_event_id)
+                logging.warning("_zulip_to_matrix; found existing matrix thread: %s with id: %s", ztopic, thread_event_id)
+                break
+            else:
+                logging.warning("_zulip_to_matrix; skipping %s as it does not match matrix thread: %s", ztopic, msg["subject"])
 
+        # Forward Zulip message to Matrix and ensure they go into a thread if there is any
+        if thread_event_id is None:
+            logging.warning("_zulip_to_matrix; no matching thread found, creating...")
+            created_thread_event_id = self._matrix_send(
+				room_id=room_id,
+				message_type="m.room.message",
+				content={"msgtype": "m.text", "body": "#" + msg["subject"] + "# New Matrix THREAD <-> TOPIC initiated (#" + msg["subject"] + "#). Your client must support threading to view it properly!"},
+			)
+            self._matrix_send(
+				room_id=room_id,
+				message_type="m.room.message",
+				content={"m.relates_to":{"rel_type": "m.thread","event_id": created_thread_event_id}, "msgtype": "m.text", "body": content}
+            )
+        else:
+             self._matrix_send(
+                    room_id=room_id,
+                    message_type="m.room.message",
+                    content={"m.relates_to":{"rel_type": "m.thread","event_id": thread_event_id}, "msgtype": "m.text", "body": content}
+                )
+        
         # Get embedded files.
         files_to_send, media_success = asyncio.run_coroutine_threadsafe(
             self.handle_media(msg["content"]), self.loop
@@ -499,19 +608,51 @@ class ZulipToMatrix:
                 executor, self.zulip_client.call_on_each_message, self._zulip_to_matrix
             )
 
+
+#def find_thread_topic(thread, topic)
+#    """
+#    check for (matching) Matrix threads
+#    https://spec.matrix.org/unstable/client-server-api/#threading
+#    room_get_threads(access_token, room_id, include=ThreadInclusion.all, paginate_from=None, limit=None)
+#
+#    example usage:
+#    mthreads = asyncio.run_coroutine_threadsafe(find_thread_topic(room_id), self.loop)
+#    m = mthreads.result()
+#    """
+#    thread_event_id = None
+#    matching_event_ids = []
+#
+#    for message in thread:
+#        body = message.source['content']['body']
+#        mthread = matrix_validate_topic(body)
+#        if ztopic == mthread:
+#            thread_event_id = message.event_id
+#            matching_event_ids.append(thread_event_id)
+#            logging.warning("_zulip_to_matrix; found existing matrix thread: %s with id: %s", ztopic, thread_event_id)
+#            break
+#        else:
+#            logging.warning("_zulip_to_matrix; skipping %s as it does not match matrix thread: %s", ztopic, msg["subject"])
+#
+#    # Forward Zulip message to Matrix and ensure they go into a thread if there is any
+#    if thread_event_id is None:
+#        logging.warning("_zulip_to_matrix; no matching thread found, creating...")
+#
+
 def matrix_validate_topic(content):
     """
     Matrix -> Zulip validate if a topic was given with:
         #<topic># <message>
+    or
+        @username #<topic># <message>
     """
     # find a zulip topic if any (first line only)
-    msg_subject = re.search(r"#([\w\s\(\)]+)#\s.*",content)
+    msg_subject = re.search(r"^(?:@\w+:[^#]+)?#(.*?)#", content)
     if msg_subject:
         topic = msg_subject.group(1)
-        logging.debug("valid topic found: >%s<", topic)
+        logging.warning("valid topic found: >%s<", topic)
     else:
         topic = None
-        logging.debug("no (valid) topic found!")
+        logging.warning("no (valid) topic found!")
     return topic
 
 def matrix_validate_cmd(content):
