@@ -34,7 +34,7 @@ import zulip
 # change these templates to change the format of displayed message
 ZULIP_MESSAGE_TEMPLATE: str = "**{username}** [{uid}]: {message}"
 #MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @**{username}** : {message}"
-MATRIX_MESSAGE_TEMPLATE = "#{topic}# | @{username}: {message}"
+MATRIX_MESSAGE_TEMPLATE = "@{username} wrote:\n{message}"
 MATRIX_NOTICE_TEMPLATE = "****Bridge notice****\n{message}"
 
 # required to talk with the bot in a bridged Matrix room:
@@ -42,8 +42,14 @@ matrix_bot_prefix = '!zm'
 matrix_bot_prefix_len = len(matrix_bot_prefix)
 matrix_bot_max_cmd_len = matrix_bot_prefix_len + 10
 
-# code vars
-bridge_error_retry_timeout = 2  # delay before the bridge will be restarted in case of an error 
+# how often should the bridge restart in case of an internal error
+# increasing this can cause serious issues like re-creating threads and/or topics
+bridge_restart_max_retry = 1
+# delay before the bridge will be restarted in case of an error 
+bridge_restart_delay = 2
+
+# logging level
+# INFO, DEBUG, WARNING, ERROR
 loglevel = "INFO"
 #loglevel = "DEBUG"
 
@@ -149,6 +155,10 @@ class MatrixToZulip:
         if not raw_content:
             return
 
+        # TODO: handle redaction, edits properly instead of ignoring
+        if not hasattr(event, 'body'):
+            return
+
         for s in self.zulip_config:
             if s != "api_key":
                 v = self.zulip_config[s]
@@ -157,29 +167,63 @@ class MatrixToZulip:
                 logging.debug("parsed zulip_config: %s=REDACTED", s)
 
         logging.debug("ROOM: %s", vars(room))
+
+        # get available Matrix threads
+        threads_dict = {}
+        threads_linked = {}
+        m = await self._get_matrix_threads(room.room_id)
+        for mxthreads in m:
+            if 'body' in mxthreads.source['content']:
+                threadstart_body = mxthreads.source['content']['body']
+                thread_name = matrix_validate_topic(threadstart_body)
+                thread_event_id = mxthreads.event_id
+
+                if thread_name:
+                    threads_dict[thread_name] = thread_event_id
+                else:
+                    logging.warning("threadstart_body is not in expected format: %s, %s", threadstart_body, thread_event_id)
+
+                threads_flat = json.dumps(mxthreads.source['unsigned'])
+
+                logging.debug("threads source is: %s", mxthreads.source)
+                logging.debug("current event id: %s", event.event_id)
+                    
+                if threads_flat and (event.event_id in threads_flat
+                                     and 'unsigned' in mxthreads.source
+                                     and 'm.relations' in mxthreads.source['unsigned']):
+                    in_thread = True
+                    logging.debug("we found a matching event id: %s", event.event_id)
+                    logging.debug("we are in a matrix thread with zulip topic: %s and id: %s", thread_name, thread_event_id)
+                    threads_dict[thread_name] = thread_event_id
+
+        # get available Zulip topics
+        s_id = self.zulip_client.get_stream_id(stream)
+        zp_topics = self.zulip_client.get_stream_topics(s_id["stream_id"])
+        zulip_topics = zp_topics['topics']
+        logging.debug("topic handling. stream name: %s, stream_id: %s", stream, s_id["stream_id"])
+        logging.debug("topics found: %s", zulip_topics)
+
         # check bot cmd
         botcmd = False
-        if event.body is not None:
+        if hasattr(event, 'body') and event.body:
             botcmd = matrix_validate_cmd(event.body[:matrix_bot_prefix_len])
             if botcmd:
                 logging.warning("BOT CMD detected! -> %s", event.body[:matrix_bot_prefix_len])
                 if event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len] == " topics":
-                    s_id = self.zulip_client.get_stream_id(stream)
-                    avail_topics = self.zulip_client.get_stream_topics(s_id["stream_id"])
-                    logging.debug("topic handling. stream name: %s, stream_id: %s", stream, s_id["stream_id"])
-                    logging.warning("topics found: %s", avail_topics)
-                    formatted_names = []
+                    # parse topics, threads and create clickable links if possible
+                    tl = find_topics_threads(room.room_id, zulip_topics, threads_dict, "threadlinks")
+                    threads_linked = tl.get("threads_linked", {})
+                    threads_unlinked = tl.get("threads_unlinked", {})
+                    linked_topics = ", ".join(threads_linked.values())
+                    unlinked_topics = "<br/>".join(threads_unlinked.values())
 
-                    for t in avail_topics['topics']:
-                        name_with_hash = f"#{t['name']}#"
-                        formatted_names.append(name_with_hash)
-
-                    #names_hashed = "\n".join(formatted_names)
-                    names_hashed = '<br/>'.join([f'{tname}' for tname in formatted_names])
-
-                    msg_notice = "Here the list of current available topics, to use one copy the whole tag #<name># and prefix it in your message:<br/><br/>" + names_hashed
-                    #TODO: logging.warning("no topics found!")
-                    #msg_notice = "no topics found for stream (" + stream + ")"
+                    msg_notice = f"""<b>Zulip topics and their corresponding Matrix threads!</b><br/>
+                    Click on a topic name <code>#name#</code> and continue a discussion there:<br/><br/>{linked_topics}
+                    <br/><br/>
+                    The following topics do not exist as a Matrix thread yet - but on Zulip.<br/>
+                    Use the given command to create a matching Matrix thread:<br/><br/>
+                    <pre>{unlinked_topics}</pre>
+                    """
                 else:
                     msg_notice = matrix_bot_cmd(event.body[matrix_bot_prefix_len:matrix_bot_max_cmd_len])
 
@@ -190,24 +234,10 @@ class MatrixToZulip:
                             )
                 return
 
-        s_id = self.zulip_client.get_stream_id(stream)
-        avail_topics = self.zulip_client.get_stream_topics(s_id["stream_id"])
-        logging.debug("topic handling. stream name: %s, stream_id: %s", stream, s_id["stream_id"])
-        logging.debug("topics found: %s", avail_topics)
-        formatted_names = []
-
-        for t in avail_topics['topics']:
-            name_with_hash = t['name']
-            formatted_names.append(name_with_hash)
-
-
-
-        # TODO: DEDUP with ZulipToMatrix!
         # check for (matching) Matrix threads
         # https://spec.matrix.org/unstable/client-server-api/#threading
         # https://spec.matrix.org/unstable/client-server-api/#validation-of-mthread-relationships
-        m = await self._get_matrix_threads(room.room_id)
-
+        # TODO: DEDUP with ZulipToMatrix!
         thread_event_id = None
         matching_event_ids = []
         in_thread = False
@@ -221,55 +251,46 @@ class MatrixToZulip:
                 ztopic = matrix_validate_topic(threadstart_body)
                 thread_event_id = message.event_id
 
-                logging.debug("message source is: %s", message.source)
-                logging.debug("current event id: %s", event.event_id)
-                    
                 if message_flat and (event.event_id in message_flat
                                      and 'unsigned' in message.source
                                      and 'm.relations' in message.source['unsigned']):
                     in_thread = True
                     logging.debug("we found a matching event id: %s", event.event_id)
                     logging.debug("we are in a matrix thread with zulip topic: %s and id: %s", ztopic, thread_event_id)
-                    break
+                    break   # FIXME: this will break only from the if - not the for loop!
                 else:
                     # if we are NOT in a thread
                     logging.warning("No matching event id (%s), i.e. we are not in a Matrix thread.", event.event_id)
-                    # check for existing threads which match the zulip topic
-                    topic_msg = matrix_validate_topic(event.body)
-                    if topic_msg and any(topic['name'] == topic_msg for topic in avail_topics['topics']):
-                        tt_match = False
-                        for message2 in m:
-                            if 'body' in message2.source['content']:
-                                threadstart_body2 = message2.source['content']['body']
-                                ztopic2 = matrix_validate_topic(threadstart_body2)
-                                thread_event_id2 = message2.event_id
-                                if ztopic2 == topic_msg:
-                                    tt_match = True
-                                    logging.debug("ztopic == topic_msg %s / %s", ztopic2, topic_msg)
-                                else:
-                                    logging.debug("ztopic2: %s / %s", ztopic2, topic_msg)
-                            else:
-                                logging.debug("no body in source2[content]: %s", message2.source)
 
-                            if tt_match:
-                                logging.warning("Matrix thread exists for Zulip topic: %s -> %s", topic_msg, thread_event_id)
-                                thread_link = "https://matrix.to/#/" + room.room_id + "/" + thread_event_id2
-                                msg_notice = f"""<b>YOUR MESSAGE WAS NOT BRIDGED TO ZULIP!</b><br/>
-                                Reason: <i>There is an existing Matrix thread for your topic!</i><br/>
-                                <br/>
-                                <a href='{thread_link}'>#{topic_msg}#</a> 👈️ click to open the related Matrix thread
-                                """
-                                await self.matrix_client.room_send(
-                                      room.room_id,
-                                      message_type="m.room.message",
-                                      content={"msgtype": "m.notice", "body": msg_notice, "format": "org.matrix.custom.html", "formatted_body": msg_notice},
-                                      )
-                                return
+                    # if user specified a topic via #topic# check if there is an existing one already
+                    topic_msg = matrix_validate_topic(event.body)
+                    tl = find_topics_threads(room.room_id, zulip_topics, threads_dict, "threadids")
+                    threads_linked = tl.get("threads_linked", {})
+                    tid = tl.get("threads_ids", {})
+                    if topic_msg and topic_msg in tid:
+                        thread_link = threads_linked[topic_msg]
+                        logging.warning("Matrix thread exists for Zulip topic: %s -> %s -> %s", topic_msg, thread_event_id, thread_link)
+                        if thread_link:
+                            msg_notice = f"""<b>YOUR MESSAGE WAS NOT BRIDGED TO ZULIP!</b><br/>
+                            Reason: <i>There is an existing Matrix thread for your topic!</i><br/>
+                            <br/>
+                            {thread_link} 👈️ click to open the related Matrix thread
+                            """
+                        else:
+                            msg_notice = f"""<b>YOUR MESSAGE WAS NOT BRIDGED TO ZULIP!</b><br/>
+                            Reason: <i>There is an existing Matrix thread for your topic!</i><br/>
+                            Due to an internal error we cannot find it though.. try <code>{matrix_bot_prefix} topics</code>
+                            """
+                        await self.matrix_client.room_send(
+                              room.room_id,
+                              message_type="m.room.message",
+                              content={"msgtype": "m.notice", "body": msg_notice, "format": "org.matrix.custom.html", "formatted_body": msg_notice},
+                              )
+                        return
                     else:
                         logging.warning("no match found for: %s", ztopic)
             else:
                 logging.debug("no body in source[content]: %s", message.source)
-                        
 
         # check topic next
         try:
@@ -277,7 +298,6 @@ class MatrixToZulip:
                 subject = ztopic
                 content = raw_content
             else:
-                #subject = matrix_validate_topic(raw_content)
                 subject = matrix_validate_topic(event.body)
                 if self.zulip_config["enforce_topic_per_room"] == "true" and subject == None:
                     # if set: do not allow setting custom topics:
@@ -300,6 +320,19 @@ class MatrixToZulip:
                         subject = subject
                         logging.info("zulip topic found from message: %s", subject)
                         content = re.sub("#"+subject+"#","",raw_content)
+                        logging.warning("no matching thread found, creating...")
+                        msg_notice = "#" + subject + "#\nNew Matrix THREAD<->TOPIC created!\n<i>Note: Your client must support threading to view it properly!</i><br/>Only use this thread for this topic from now on."
+                        msg_notice_html = "<b>#" + subject + "#</b><br/>New Matrix THREAD<->TOPIC created!<br/><i>Note: Your client must support threading to view it properly!</i><br/>Only use this thread for this topic from now on."
+                        created_thread = await self.matrix_client.room_send(
+                            room.room_id,
+                            message_type="m.room.message",
+                            content={"msgtype": "m.text", "body": msg_notice, "format": "org.matrix.custom.html", "formatted_body": msg_notice_html},
+                        )
+                        await self.matrix_client.room_send(
+                            room.room_id,
+                            message_type="m.room.message",
+                            content={"m.relates_to":{"rel_type": "m.thread","event_id": created_thread.event_id}, "msgtype": "m.text", "body": content}
+                        )
         except ValueError as err:
             msg_notice = f"""<b>YOUR MESSAGE WAS NOT BRIDGED TO ZULIP!</b><br/>
             Reason: <i>no Zulip topic given!</i><br/>
@@ -613,7 +646,7 @@ class ZulipToMatrix:
 
         # if stream and topic match - return room id
         if key in self.zulip_config["bridges"]:
-            logging.warning("requested stream/topic is configured: %s", key)
+            logging.debug("requested stream/topic is configured: %s", key)
             return self.zulip_config["bridges"][key]
         # if stream not configured at all - skip
         elif not any(msg["display_recipient"] in k for k in self.zulip_config["bridges"]):
@@ -699,6 +732,36 @@ class ZulipToMatrix:
             await asyncio.get_event_loop().run_in_executor(
                 executor, self.zulip_client.call_on_each_message, self._zulip_to_matrix
             )
+
+def find_topics_threads(roomid, zulip_topics, threads_dict, ret, tname=None):
+    """
+    search for a topic (tname) within Zulip topics (zulip_topics)
+    and find matches of that topic with a Matrix thread (threads_dict)
+    returns a given type: threadlinks or threadids or None
+    """
+    threads_ids = {}
+    threads_linked = {}
+    threads_unlinked = {}
+    res = None
+
+    for zt in zulip_topics:
+        topic_name = zt.get('name')
+        logging.debug("topic >%s< in topics: %s", topic_name, zulip_topics)
+
+        if topic_name in threads_dict:
+            thread_link = "https://matrix.to/#/" + roomid + "/" + threads_dict[topic_name]
+            threads_linked[topic_name] = f"<a href='{thread_link}'>#{topic_name}#</a>"
+            threads_ids[topic_name] = threads_dict[topic_name]
+        else:
+            threads_unlinked[topic_name] = f"#{topic_name}# type your message here"
+            logging.debug("topic >%s< not found in thread dict: %s", topic_name, threads_dict)
+
+#    if ret == "threadlinks":
+#        res = {"threads_linked": threads_linked, "threads_unlinked": threads_unlinked}
+#    elif ret == "threadids" and threads_ids:
+#        res = threads_ids
+    
+    return {"threads_linked": threads_linked, "threads_unlinked": threads_unlinked, "threads_ids": threads_ids}
 
 def matrix_validate_topic(content):
     """
@@ -903,6 +966,9 @@ async def run(zulip_config: Dict[str, Any], matrix_config: Dict[str, Any], no_no
 
     # Initiate clients and start the event listeners.
     backoff = zulip.RandomExponentialBackoff(timeout_success_equivalent=300)
+
+    retry_count = 0
+
     while backoff.keep_going():
         try:
             zulip_client = zulip.Client(
@@ -922,20 +988,20 @@ async def run(zulip_config: Dict[str, Any], matrix_config: Dict[str, Any], no_no
             await asyncio.gather(matrix_to_zulip.run(), zulip_to_matrix.run())
 
         except BridgeFatalMatrixError as exception:
-            logging.error("Matrix bridge error occured: >%s<. Restarting bridge in %is", exception, bridge_error_retry_timeout)
-            await asyncio.sleep(bridge_error_retry_timeout)
+            logging.error("Matrix bridge error occured: >%s<. Restarting bridge in %is", exception, bridge_restart_delay)
+            await asyncio.sleep(bridge_restart_delay)
 
         except BridgeFatalZulipError as exception:
-            logging.error("Zulip bridge error occured: >%s<. Restarting bridge in %is", exception, bridge_error_retry_timeout)
-            await asyncio.sleep(bridge_error_retry_timeout)
+            logging.error("Zulip bridge error occured: >%s<. Restarting bridge in %is", exception, bridge_restart_delay)
+            await asyncio.sleep(bridge_restart_delay)
 
         except zulip.ZulipError as exception:
-            logging.error("Zulip error occured: >%s<. Restarting bridge in %is", exception, bridge_error_retry_timeout)
-            await asyncio.sleep(bridge_error_retry_timeout)
+            logging.error("Zulip error occured: >%s<. Restarting bridge in %is", exception, bridge_restart_delay)
+            await asyncio.sleep(bridge_restart_delay)
 
         except Exception as e:
             traceback.print_exc()
-            logging.error("Internal exception occured. Restarting bridge in %is", bridge_error_retry_timeout)
+            logging.error("Internal exception occured. Restarting bridge in %is", bridge_restart_delay)
             break
 
         finally:
@@ -943,8 +1009,12 @@ async def run(zulip_config: Dict[str, Any], matrix_config: Dict[str, Any], no_no
                 await matrix_client.close()
 
         backoff.fail()
+        retry_count += 1
+        logging.info(f"Retry attempt: {retry_count}/{bridge_restart_max_retry}")
 
-
+        if retry_count >= bridge_restart_max_retry:
+            logging.error(f"FATAL! Maximum retry attempts ({bridge_restart_max_retry}) reached. Exiting...")
+            break
 
 
 def write_sample_config(target_path: str, zuliprc: Optional[str]) -> None:
