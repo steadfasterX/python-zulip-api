@@ -1,21 +1,26 @@
 # Matrix <==> Zulip bridge
 
-This acts as a (non-puppeting) bridge between Matrix and Zulip.
+This acts as a simple and (non-puppeting) bridge between Matrix and Zulip.
 
 ### Features
 
-|state|site|feature|notes|
-|-|-|-|-|
-|✅|Matrix => Zulip|messages||
-|✅|Zulip => Matrix|messages||
-|✅|Matrix => Zulip|media handling|handling files according to their mimetype|
-|✅|Zulip => Matrix|media handling|handling files according to their mimetype|
-|🛠️|Matrix => Zulip|reactions||
-|🛠️|Zulip => Matrix|reactions||
-|🛠️|Matrix => Zulip|encryption|partly implemented|
-|🛠️|Zulip => Matrix|encryption|partly implemented|
-|🛠️|Matrix => Zulip|bridge message redaction/delete||
-|🛠️|Zulip => Matrix|bridge message redaction/delete||
+Currently set of features is quite basic but it's planned to extend it as described.
+
+|state|direction|function|
+|-|-|-|
+|✅|Matrix => Zulip|send message|
+|✅|Zulip => Matrix|send message|
+|✅|Matrix => Zulip|media handling|
+|✅|Zulip => Matrix|media handling|
+|🛠️|Matrix => Zulip|set reactions|
+|🛠️|Zulip => Matrix|set reactions|
+|🛠️|Matrix => Zulip|encryption|
+|🛠️|Zulip => Matrix|encryption|
+|🛠️|Matrix => Zulip|emoji + message redaction/delete|
+|🛠️|Zulip => Matrix|emoji + message redaction/delete|
+|🛠️|Matrix => Zulip|edit messages|
+|🛠️|Zulip => Matrix|edit messages|
+
 
 ### Implementation Concept
 
