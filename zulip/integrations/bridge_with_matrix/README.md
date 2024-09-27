@@ -27,7 +27,7 @@ Zulip uses a "stream+topic" concept which will be translated by this bridge to M
 |Stream|<=>|Room|
 |Topic|<=>|Thread²|
 
-- ¹) *Client(s) must support this Matrix feature to make use of it. Most modern clients do so though.*
+- ¹) *Optional but makes sense if using multiple streams. Client(s) must support this Matrix feature to make use of it. Most modern clients do so though.*
 - ²) *Client(s) connecting to a Matrix room HAVE TO support the Matrix threading standard. Most modern clients do so though.*
 
 Zulip makes heavy use of topics - ideally where any user can freely create a topic within a stream as they wish.
