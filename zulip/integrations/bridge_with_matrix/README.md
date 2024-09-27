@@ -1,11 +1,42 @@
-# Matrix <--> Zulip bridge
+# Matrix <==> Zulip bridge
 
-This acts as a bridge between Matrix and Zulip.
+This acts as a (non-puppeting) bridge between Matrix and Zulip.
 
-### Enhanced Features
-- Supporting multiple (Zulip topic, Matrix channel)-pairs.
-- Handling files according to their mimetype.
+### Features
 
+|state|site|feature|notes|
+|-|-|-|-|
+|✅|Matrix => Zulip|messages||
+|✅|Zulip => Matrix|messages||
+|✅|Matrix => Zulip|media handling|handling files according to their mimetype|
+|✅|Zulip => Matrix|media handling|handling files according to their mimetype|
+|🛠️|Matrix => Zulip|reactions||
+|🛠️|Zulip => Matrix|reactions||
+|🛠️|Matrix => Zulip|encryption|partly implemented|
+|🛠️|Zulip => Matrix|encryption|partly implemented|
+|🛠️|Matrix => Zulip|bridge message redaction/delete||
+|🛠️|Zulip => Matrix|bridge message redaction/delete||
+
+### Implementation Concept
+
+Zulip uses a "stream+topic" concept which will be translated by this bridge to Matrix as "room+thread".
+
+|Zulip||Matrix|
+|-|-|-|
+|Project|<=>|Space¹|
+|Stream|<=>|Room|
+|Topic|<=>|Thread²|
+
+- ¹) *Client(s) must support this Matrix feature to make use of it. Most modern clients do so though.*
+- ²) *Client(s) connecting to a Matrix room HAVE TO support the Matrix threading standard. Most modern clients do so though.*
+
+Zulip makes heavy use of topics - ideally where any user can freely create a topic within a stream as they wish.
+A previous release of this bridge was able to handle fixed "stream+topic" combinations only - which in fact is against the Zulip's way of acting (users can/should create new topics at any time).
+The bridge still supports that static approach but also allows to bridge **any** topic to a Matrix room - if that feature is enabled.
+
+Note: theoretically you can bridge several Zulip *streams* within the same Matrix *room* but it will become very unreadable usually. So best practice here is to use a single "Matrix room <=> Zulip stream" mapping. Combined with creating a "Space" in Matrix where you can add all Matrix rooms makes the whole Zulip to Matrix feeling perfect.
+
+The configuration file can handle multiple of "stream<->room : topic" combinations so you can run just a single bot for all if you like or 1 bot per combination.
 
 ## Installation
 
@@ -78,29 +109,3 @@ in a file called `matrix_bridge.conf`:
 
 * If you are running from the Zulip GitHub repo: run `python matrix_bridge.py -c matrix_bridge.conf`
 
-
-## Notes regarding IRC
-
-### Usage for IRC bridges
-
-This can also be used to indirectly bridge between IRC and Zulip.
-
-Matrix has been bridged to the listed
-[IRC networks](https://matrix-org.github.io/matrix-appservice-irc/latest/bridged_networks.html),
-where the 'Room alias format' refers to the `room_id` for the corresponding IRC channel.
-
-For example, for the Libera Chat channel `#zulip-test`, the `room_id` would be
-`#zulip-test:libera.chat`.
-
-### Caveats for IRC mirroring
-
-There are certain
-[IRC channels](https://github.com/matrix-org/matrix-appservice-irc/wiki/Channels-from-which-the-IRC-bridge-is-banned)
-where the Matrix.org IRC bridge has been banned for technical reasons.
-You can't mirror those IRC channels using this integration.
-
-
-## TODO
-
-- Adding support for editing and deleting messages?
-- Handling encryption on the Matrix side (may need further discussion).
