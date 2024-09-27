@@ -157,6 +157,7 @@ class MatrixToZulip:
 
         # TODO: handle redaction, edits properly instead of ignoring
         if not hasattr(event, 'body'):
+            logging.warning("unhandled event: >%s<", event)
             return
 
         for s in self.zulip_config:
